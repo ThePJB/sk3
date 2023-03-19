@@ -9,26 +9,12 @@ use cpal::traits::*;
 use ringbuf::*;
 use core::f32::consts::PI;
 
-// put on github
-
-// maybe we can kill 2 birds with one stone in terms of implementing try_move
-// animate either try move or want move.
-// apply will (update positions and) remove want move unless its on ice
-// do move will turn want move into move
-
-
-// MMMmmmk but why is there a gap where he stands still in a buffered movement sequence. isnt it interpolating the same time and then immediately checking and doing the next move
-// or its an ice thing
-// when on ice it will pause for SLIDE_T seconds between buffered movements
 
 // elf can slide through real cool like leaving the title behind him (etched into the ice)
 // lol imagine if i used the sprites for all kind of effects. could use them to make the checkered background
 // could use them to do pokie wheels
 
 // more and lazier snow,
-// reset resets snow t
-// add 'try move' and wall bump animation
-// its a bit like the bell, maybe i didnt want feedback lol. but maybe you should try having precise inputs
 
 // if entity is moving on snow play snow move noise
 // if entity is sliding on ice continue playing ice slide noise.. hows that, high frequency popping/sizzling
@@ -66,56 +52,103 @@ pub struct CurrentLevel {
     moving_ents: Vec<usize>,
     ent_move_x: Vec<i32>,
     ent_move_y: Vec<i32>,
+    try_move_x: Vec<i32>,
+    try_move_y: Vec<i32>,
     ent_dir_x: Vec<i32>,
 }
 
 pub struct HistoryEntry {
     moving_ents: Vec<usize>,
     ent_dir_x: Vec<i32>,
+    snow_t: f32,
 }
 
 impl CurrentLevel {
     fn can_move(&self, i: usize, j: usize, dx: i32, dy: i32) -> bool {
+        if dx == 0 && dy == 0 { return false; }
         let ni = (i as i32 + dx) as usize;
         let nj = (j as i32 + dy) as usize;
 
         self.tiles[nj*self.w + ni] != TILE_WALL && (self.moving_ents[nj*self.w + ni] == ENT_NONE || self.can_move(ni, nj, dx, dy))
     }
-    fn do_move(&mut self, i: usize, j: usize, dx: i32, dy: i32) {
-        if !self.can_move(i, j, dx, dy) {
-            self.ent_move_x[j*self.w + i] = 0;
-            self.ent_move_y[j*self.w + i] = 0;
-            return;
-        }
-        if self.moving_ents[j*self.w+i] == ENT_NONE { return; }
-
+    fn push(&mut self, i: usize, j: usize, dx: i32, dy: i32) {
+        if dx == 0 && dy == 0 { return; }
+        let idx = j*self.w + i;
+        if self.moving_ents[idx] != ENT_NONE { return; }
         let ni = (i as i32 + dx) as usize;
         let nj = (j as i32 + dy) as usize;
+        let nidx = nj*self.w + ni;
 
-        if self.can_move(ni, nj, dx, dy) {
-            self.do_move(ni, nj, dx, dy);
-        }
-        self.ent_move_x[j*self.w + i] = dx;
-        if dx != 0 {
-            self.ent_dir_x[j*self.w + i] = dx;
-        }
-        self.ent_move_y[j*self.w + i] = dy;
+        if !self.can_move(i, j, dx, dy) { return; }
+        if self.moving_ents[nidx] == ENT_NONE { return; }
+        
+        self.try_move_x[nidx] = dx;
+        self.try_move_y[nidx] = dy;
+
+        self.push(ni, nj, dx, dy);
     }
-    fn move_players(&mut self, dx: i32, dy: i32) {
+    // sets move if entity with try_move can move
+    // try move needs to propagate if can move
+    // yea just try move propagation is annoying
+
+    fn set_try_move(&mut self, i: usize, j: usize, dx: i32, dy: i32) {
+        let idx = j*self.w+i;
+        if self.moving_ents[idx] == ENT_NONE { return; }
+        if dx == 0 && dy == 0 { return; }
+        self.try_move_x[idx] = dx;
+        self.try_move_y[idx] = dy;
+        let ni = (i as i32 + dx) as usize;
+        let nj = (j as i32 + dy) as usize;
+        self.set_try_move(ni, nj, dx, dy);
+    }
+
+    fn resolve_movement_attempts(&mut self) {
+        println!("resolve movt attempts");
         for i in 0..self.w {
             for j in 0..self.h {
-                if self.moving_ents[j*self.w+i] == ENT_PLAYER {
-                    if self.can_move(i, j, dx, dy) {
-                        self.do_move(i, j, dx, dy);
+                let idx = j*self.w + i;
+                if self.moving_ents[idx] == ENT_NONE { continue; }
+                if self.try_move_x[idx] == 0 && self.try_move_y[idx] == 0 { continue; }
+                self.push(i, j, self.try_move_x[idx], self.try_move_y[idx]);
+            }
+        }
+
+        for i in 0..self.w {
+            for j in 0..self.h {
+                let idx = j*self.w + i;
+                if self.moving_ents[idx] == ENT_NONE { continue; }
+                if self.try_move_x[idx] == 0 && self.try_move_y[idx] == 0 { continue; }
+                if self.can_move(i, j, self.try_move_x[idx], self.try_move_y[idx]) {
+                    println!("setting move {} {}", i, j);
+                    self.ent_move_x[idx] = self.try_move_x[idx];
+                    if self.moving_ents[idx] == ENT_PLAYER && self.try_move_x[idx] != 0 {
+                        self.ent_dir_x[idx] = self.try_move_x[idx];
                     }
+                    self.ent_move_y[idx] = self.try_move_y[idx];
+                } else {
+                    println!("canmove false at {} {}", i, j);
                 }
             }
         }
     }
+
+    fn move_players(&mut self, dx: i32, dy: i32) {
+        for i in 0..self.w {
+            for j in 0..self.h {
+                if self.moving_ents[j*self.w+i] == ENT_PLAYER {
+                    self.set_try_move(i, j, dx, dy);
+                }
+            }
+        }
+        self.resolve_movement_attempts();
+    }
+    // needs to transform move into actual movement
+    // move is NEVER retained
+    // try move is ONLY retained if something gets moved to ice
     fn apply_move(&mut self) {
         let mut next_ents = vec![ENT_NONE; self.w*self.h];
-        let mut next_move_x = vec![0; self.w*self.h];
-        let mut next_move_y = vec![0; self.w*self.h];
+        let mut next_try_move_x = vec![0; self.w*self.h];
+        let mut next_try_move_y = vec![0; self.w*self.h];
         let mut next_dir_x = vec![0; self.w*self.h];
         for i in 0..self.w {
             for j in 0..self.h {
@@ -124,16 +157,26 @@ impl CurrentLevel {
                 let nj = (j as i32 + self.ent_move_y[j*self.w+i]) as usize;
                 next_ents[nj*self.w + ni] = self.moving_ents[j*self.w+i];
                 next_dir_x[nj*self.w + ni] = self.ent_dir_x[j*self.w+i];
-                if self.tiles[nj*self.w + ni] == TILE_ICE {
-                    next_move_x[nj*self.w + ni] = self.ent_move_x[j*self.w + i];
-                    next_move_y[nj*self.w + ni] = self.ent_move_y[j*self.w + i];
+                if self.tiles[nj*self.w + ni] == TILE_ICE && (self.ent_move_x[j*self.w+i] != 0 || self.ent_move_y[j*self.w+i] != 0) {
+                    next_try_move_x[nj*self.w + ni] = self.try_move_x[j*self.w+i];
+                    next_try_move_y[nj*self.w + ni] = self.try_move_y[j*self.w+i];
                 }
             }
         }
         self.moving_ents = next_ents;
-        self.ent_move_x = next_move_x;
-        self.ent_move_y = next_move_y;
+        self.try_move_x = next_try_move_x;
+        self.try_move_y = next_try_move_y;
+        self.ent_move_x = vec![0; self.w*self.h];
+        self.ent_move_y = vec![0; self.w*self.h];
         self.ent_dir_x = next_dir_x;
+        self.propagate_try_moves();
+    }
+    fn propagate_try_moves(&mut self) {
+        for i in 0..self.w {
+            for j in 0..self.h {
+                self.set_try_move(i, j, self.try_move_x[j*self.w+i], self.try_move_y[j*self.w+i])
+            }
+        }
     }
     fn can_move_any_player(&self, dx: i32, dy: i32) -> bool {
         for i in 0..self.w {
@@ -147,31 +190,13 @@ impl CurrentLevel {
         }
         return false;
     }
-    fn should_do_again(&self) -> bool {
-        for i in 0..self.w {
-            for j in 0..self.h {
-                let dx = self.ent_move_x[j*self.w + i];
-                let dy = self.ent_move_y[j*self.w + i];
-                if dx != 0 || dy != 0 {
-                    return true;
-                }
+    fn any_try_move(&self) -> bool {
+        for idx in 0..self.try_move_x.len() {
+            if self.try_move_x[idx] != 0 || self.try_move_y[idx] != 0 {
+                return true;
             }
         }
         return false;
-    }
-    fn do_again(&mut self) {
-        for i in 0..self.w {
-            for j in 0..self.h {
-                if self.ent_move_x[j*self.w + i] != 0 || self.ent_move_y[j*self.w + i] != 0 {
-                    if self.can_move(i, j, self.ent_move_x[j*self.w + i], self.ent_move_y[j*self.w + i]) {
-                        self.do_move(i, j, self.ent_move_x[j*self.w + i], self.ent_move_y[j*self.w + i])
-                    } else {
-                        self.ent_move_x[j*self.w + i] = 0;
-                        self.ent_move_y[j*self.w + i] = 0;
-                    }
-                }
-            }
-        }
     }
     fn remaining_presents(&self) -> usize {
         let mut acc = 0;
@@ -275,8 +300,6 @@ impl Level {
     fn to_current(&self) -> CurrentLevel {
         let mut static_ents = vec![ENT_NONE; self.w*self.h];
         let mut moving_ents = vec![ENT_NONE; self.w*self.h];
-        let ent_move_x = vec![0; self.w*self.h];
-        let ent_move_y = vec![0; self.w*self.h];
 
         for idx in 0..self.entities.len() {
             let (i, j, e) = self.entities[idx];
@@ -294,9 +317,11 @@ impl Level {
             tiles: self.tiles.clone(), 
             static_ents, 
             moving_ents, 
-            ent_move_x: ent_move_x.clone(), 
-            ent_move_y,
-            ent_dir_x: ent_move_x.clone(),
+            ent_move_x: vec![0; self.w*self.h], 
+            ent_move_y: vec![0; self.w*self.h],
+            ent_dir_x: vec![0; self.w*self.h],
+            try_move_x: vec![0; self.w*self.h],
+            try_move_y: vec![0; self.w*self.h],
         }
     }
 }
@@ -804,6 +829,7 @@ fn main() {
         let mut curr_level_num = 0;
 
         let mut t = 0.0;
+        let mut snow_t = 0.0;
         let mut t_move = 0.0;
         let mut t_last = Instant::now();
         let mut mouse_pos = v2(0., 0.);
@@ -882,14 +908,16 @@ fn main() {
                                                 buffered_dx = dx;
                                                 buffered_dy = dy;
                                             } else if !victory {
+                                                curr_level.move_players(dx, dy);
+                                                t_move = t;
+                                                animating = true;
                                                 if curr_level.can_move_any_player(dx, dy) {
-                                                    animating = true;
                                                     history.push(HistoryEntry {
                                                         moving_ents: curr_level.moving_ents.clone(),
                                                         ent_dir_x: curr_level.ent_dir_x.clone(),
+                                                        snow_t,
                                                     });
-                                                    curr_level.move_players(dx, dy);
-                                                    t_move = t;
+                                                    
                                                     prod.push(Sound { id: 1, birthtime: t as f32, elapsed: 0.0, remaining: 0.1, magnitude: 0.1, mag_exp: 0.999, frequency: 440.0, freq_exp: 1.0, wait: 0.0, phase: 0.0 }).unwrap();
                                                 } else {
                                                     prod.push(Sound { id: 1, birthtime: t as f32, elapsed: 0.0, remaining: 0.1, magnitude: 0.1, mag_exp: 0.999, frequency: 220.0, freq_exp: 0.999, wait: 0.0, phase: 0.0 }).unwrap();
@@ -902,6 +930,7 @@ fn main() {
                                                 if let Some(he) = history.pop() {
                                                     curr_level.moving_ents = he.moving_ents;
                                                     curr_level.ent_dir_x = he.ent_dir_x;
+                                                    snow_t = he.snow_t;
                                                     prod.push(Sound { id: 1, birthtime: t as f32, elapsed: 0.0, remaining: 0.2, magnitude: 0.1, mag_exp: 0.9999, frequency: 100.0, freq_exp: 1.0002, wait: 0.0, phase: 0.0 }).unwrap();
                                                 }
                                             }
@@ -920,6 +949,7 @@ fn main() {
                     let t_now = Instant::now();
                     let dt = (t_now - t_last).as_secs_f64();
                     t += dt;
+                    snow_t += dt as f32;
                     t_last = t_now;
 
                     let mut canvas = CTCanvas::new();
@@ -953,9 +983,10 @@ fn main() {
                         if n_pres2 > n_pres {
                             prod.push(Sound { id: 1, birthtime: t as f32, elapsed: 0.0, remaining: 0.1, magnitude: 0.1, mag_exp: 0.999, frequency: 440.0 / (3./2.), freq_exp: 1.0, wait: 0.0, phase: 0.0 }).unwrap();
                         }
-                        if curr_level.should_do_again() {
+                        if curr_level.any_try_move() {
+                            dbg!("any try move true");
                             t_move = t;
-                            curr_level.do_again();
+                            curr_level.resolve_movement_attempts();
                         } else {
                             if buffered_dx != 0 || buffered_dy != 0 && !victory {
                                 if curr_level.can_move_any_player(buffered_dx, buffered_dy) {
@@ -964,6 +995,7 @@ fn main() {
                                     history.push(HistoryEntry {
                                         moving_ents: curr_level.moving_ents.clone(),
                                         ent_dir_x: curr_level.ent_dir_x.clone(),
+                                        snow_t,
                                     });
                                     curr_level.move_players(buffered_dx, buffered_dy);
 
@@ -1039,7 +1071,8 @@ fn main() {
 
                     for i in 0..curr_level.w {
                         for j in 0..curr_level.h {
-                            let sprite = match curr_level.moving_ents[j*curr_level.w+i] {
+                            let idx = j*curr_level.w+i;
+                            let sprite = match curr_level.moving_ents[idx] {
                                 ENT_PLAYER => if t % 1.0 > 0.5 {
                                     4 
                                 } else {
@@ -1050,14 +1083,26 @@ fn main() {
                                 _ => continue,
                             };
                             let mut r = level_rect.grid_child(i, j, w, h);
-                            let x_shift = curr_level.ent_move_x[j*curr_level.w+i] as f32 * r.w * ((t - t_move)/SLIDE_T) as f32;
-                            let y_shift = curr_level.ent_move_y[j*curr_level.w+i] as f32 * r.z * ((t - t_move)/SLIDE_T) as f32;
+                            let mut x_shift = curr_level.ent_move_x[idx] as f32 * r.w * ((t - t_move)/SLIDE_T) as f32;
+                            let mut y_shift = curr_level.ent_move_y[idx] as f32 * r.z * ((t - t_move)/SLIDE_T) as f32;
+                            if x_shift == 0.0 && y_shift == 0.0 {
+                                let tt = ((t - t_move)/SLIDE_T) as f32;
+                                let ss = 1./16. * 2.0 * (0.5 - (tt - 0.5).abs());
+                                x_shift = curr_level.try_move_x[idx] as f32 * r.w * ss;
+                                y_shift = curr_level.try_move_y[idx] as f32 * r.z * ss;
+                            }
                             r.x += x_shift;
                             r.y += y_shift;
 
-                            let colour = v4(1., 1., 1., 1.);
+                            let mut colour = v4(1., 1., 1., 1.);
+                            // if curr_level.try_move_x[idx] != 0 || curr_level.try_move_y[idx] != 0 {
+                            //     colour = v4(0., 1., 0., 1.);
+                            // }
+                            // if curr_level.ent_move_x[idx] != 0 || curr_level.ent_move_y[idx] != 0 {
+                            //     colour = v4(0., 0., 1., 1.);
+                            // }
 
-                            if curr_level.moving_ents[j*curr_level.w+i] == ENT_PLAYER && curr_level.ent_dir_x[j*curr_level.w+i] >= 0 {
+                            if curr_level.moving_ents[idx] == ENT_PLAYER && curr_level.ent_dir_x[idx] >= 0 {
                                 canvas.put_sprite_flipx(sprite, r, -0.2, colour);
                             } else {
                                 canvas.put_sprite(sprite, r, -0.2, colour);
@@ -1071,7 +1116,7 @@ fn main() {
                     for i in 0..num_cols.floor() as usize + 10 {
                         let col_x = 2.0 * i as f32 / num_cols as f32;
                         let col_seed = khash(i + 12312947);
-                        let phase = (krand(col_seed) + 0.05*t as f32) % 1.0;
+                        let phase = (krand(col_seed) + 0.05*snow_t as f32) % 1.0;
                         let y = phase * 2.5 - 1.5;
                         let x = (col_x + phase * 0.05 + 0.07*(10.0 * phase + 2.0*PI*krand(col_seed+1238124517)).sin()) * 2.0 - 1.5;
                         let r = v4(x, y, 0.03/aspect, 0.03);
