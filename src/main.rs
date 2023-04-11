@@ -9,6 +9,387 @@ use cpal::traits::*;
 use ringbuf::*;
 use core::f32::consts::PI;
 
+// ====================
+// Math
+// ====================
+// might be fucked since it was meant to be 32 bits
+pub fn khash(mut state: usize) -> usize {
+    state = (state ^ 2747636419).wrapping_mul(2654435769);
+    state = (state ^ (state >> 16)).wrapping_mul(2654435769);
+    state = (state ^ (state >> 16)).wrapping_mul(2654435769);
+    state
+}
+pub fn krand(seed: usize) -> f32 {
+    (khash(seed)&0x00000000FFFFFFFF) as f32 / 4294967295.0
+}
+
+fn lerp(a: f32, b: f32, t: f32) -> f32 {
+    a * (1.0 - t) + b * t
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct V2 {
+    x: f32,
+    y: f32,
+}
+fn v2(x: f32, y: f32) -> V2 { V2 { x, y } }
+#[derive(Clone, Copy, Debug)]
+pub struct V3 {
+    x: f32,
+    y: f32,
+    z: f32,
+}
+fn v3(x: f32, y: f32, z: f32) -> V3 { V3 { x, y, z } }
+#[derive(Clone, Copy, Debug)]
+pub struct V4 {
+    x: f32,
+    y: f32,
+    z: f32,
+    w: f32,
+}
+fn v4(x: f32, y: f32, z: f32, w: f32) -> V4 { V4 { x, y, z, w } }
+
+impl V2 {
+    pub fn dot(&self, other: V2) -> f32 {
+        self.x*other.x + self.y * other.y
+    }
+}
+impl V3 {
+    pub fn dot(&self, other: V3) -> f32 {
+        self.x*other.x + self.y * other.y + self.z*other.z
+    }
+}
+impl V4 {
+    pub fn dot(&self, other: V4) -> f32 {
+        self.x*other.x + self.y * other.y + self.z*other.z + self.w*other.w
+    }
+    pub fn tl(&self) -> V2 {v2(self.x, self.y)}
+    pub fn br(&self) -> V2 {v2(self.x + self.z, self.y + self.w)}
+    pub fn tr(&self) -> V2 {v2(self.x + self.z, self.y)}
+    pub fn bl(&self) -> V2 {v2(self.x, self.y + self.w)}
+    pub fn grid_child(&self, i: usize, j: usize, w: usize, h: usize) -> V4 {
+        let cw = self.z / w as f32;
+        let ch = self.w / h as f32;
+        v4(self.x + cw * i as f32, self.y + ch * j as f32, cw, ch)
+    }
+    pub fn hsv_to_rgb(&self) -> V4 {
+        let v = self.z;
+        let hh = (self.x % 360.0) / 60.0;
+        let i = hh.floor() as i32;
+        let ff = hh - i as f32;
+        let p = self.z * (1.0 - self.y);
+        let q = self.z * (1.0 - self.y * ff);
+        let t = self.z * (1.0 - self.y * (1.0 - ff));
+        match i {
+            0 => v4(v, t, p, self.w),
+            1 => v4(q, v, p, self.w),
+            2 => v4(p, v, t, self.w),
+            3 => v4(p, q, v, self.w),
+            4 => v4(t, p, v, self.w),
+            5 => v4(v, p, q, self.w),
+            _ => panic!("unreachable"),
+        }
+    }
+    fn contains(&self, p: V2) -> bool {
+        !(p.x < self.x || p.x > self.x + self.z || p.y < self.y || p.y > self.y + self.w)
+    }
+    fn point_within(&self, p: V2) -> V2 {
+        v2(p.x*self.z+self.x, p.y*self.w+self.y)
+    }
+    fn point_without(&self, p: V2) -> V2 {
+        v2((p.x - self.x) / self.z, (p.y - self.y) / self.w)
+    }
+    fn fit_aspect(&self, a: f32) -> V4 {
+        let a_self = self.z/self.w;
+
+        if a_self > a {
+            // parent wider
+            v4((self.z - self.z*(1.0/a))/2.0, 0.0, self.z*1.0/a, self.w)
+        } else {
+            // child wider
+            v4(0.0, (self.w - self.w*(1.0/a))/2.0, self.z, self.w*a)
+        }
+    }
+}
+
+
+// ====================
+// Canvas
+// ====================
+pub struct CTCanvas {
+    buf: Vec<u8>,
+}
+
+impl CTCanvas {
+    pub fn new() -> CTCanvas {
+        CTCanvas {
+            buf: Vec::new(),
+        }
+    }
+
+    fn put_u32(&mut self, x: u32) {
+        for b in x.to_le_bytes() {
+            self.buf.push(b);
+        }
+    }
+
+    fn put_float(&mut self, x: f32) {
+        for b in x.to_le_bytes() {
+            self.buf.push(b);
+        }
+    }
+
+    pub fn put_vertex(&mut self, p: V3, uv: V2, col: V4, mode: u32) {
+        self.put_float(p.x);
+        self.put_float(p.y);
+        self.put_float(p.z);
+        self.put_float(col.x);
+        self.put_float(col.y);
+        self.put_float(col.z);
+        self.put_float(col.w);
+        self.put_float(uv.x);
+        self.put_float(uv.y);
+        self.put_u32(mode);
+    }
+    pub fn put_triangle(&mut self, p1: V2, uv1: V2, p2: V2, uv2: V2, p3: V2, uv3: V2, depth: f32, colour: V4, mode: u32) {
+        self.put_vertex(v3(p1.x, p1.y, depth), uv1, colour, mode);
+        self.put_vertex(v3(p2.x, p2.y, depth), uv2, colour, mode);
+        self.put_vertex(v3(p3.x, p3.y, depth), uv3, colour, mode);
+    }
+    // 4 is top left
+    pub fn put_quad(&mut self, p1: V2, uv1: V2, p2: V2, uv2: V2, p3: V2, uv3: V2, p4: V2, uv4: V2, depth: f32, colour: V4, mode: u32) {
+        self.put_triangle(p1, uv1, p2, uv2, p3, uv3, depth, colour, mode);
+        self.put_triangle(p3, uv3, p4, uv4, p1, uv1, depth, colour, mode);
+    }
+
+    pub fn put_rect(&mut self, r: V4, r_uv: V4, depth: f32, colour: V4, mode: u32) {
+        self.put_triangle(r.tl(), r_uv.tl(), r.tr(), r_uv.tr(), r.bl(), r_uv.bl(), depth, colour, mode);
+        self.put_triangle(r.bl(), r_uv.bl(), r.tr(), r_uv.tr(), r.br(), r_uv.br(), depth, colour, mode);
+    }
+
+    pub fn put_rect_flipx(&mut self, r: V4, r_uv: V4, depth: f32, colour: V4, mode: u32) {
+        self.put_triangle(r.tl(), r_uv.tr(), r.tr(), r_uv.tl(), r.bl(), r_uv.br(), depth, colour, mode);
+        self.put_triangle(r.bl(), r_uv.br(), r.tr(), r_uv.tl(), r.br(), r_uv.bl(), depth, colour, mode);
+    }
+
+    pub fn put_rect_flipy(&mut self, r: V4, r_uv: V4, depth: f32, colour: V4, mode: u32) {
+        self.put_quad(r.tr(), r_uv.br(), r.br(), r_uv.tr(), r.bl(), r_uv.tl(), r.tl(), r_uv.bl(), depth, colour, mode);
+    }
+    pub fn put_rect_flipxy(&mut self, r: V4, r_uv: V4, depth: f32, colour: V4, mode: u32) {
+        self.put_triangle(r.tl(), r_uv.br(), r.tr(), r_uv.bl(), r.bl(), r_uv.tr(), depth, colour, mode);
+        self.put_triangle(r.bl(), r_uv.tr(), r.tr(), r_uv.bl(), r.br(), r_uv.tl(), depth, colour, mode);
+    }
+
+    pub fn put_glyph(&mut self, c: char, r: V4, depth: f32, colour: V4) {
+        let clip_fn = |mut c: u8| {
+            if c >= 'a' as u8 && c <= 'z' as u8 {
+                c -= 'a' as u8 - 'A' as u8;
+            }
+            if c >= '+' as u8 && c <= '_' as u8 {
+                let x = c - '+' as u8;
+                let w = '_' as u8 - '+' as u8 + 1; // maybe +1
+                Some(v4(0.0, 0.0, 1.0, 0.5).grid_child(x as usize, 0, w as usize, 1))
+            } else {
+                None
+            }
+        };
+        if let Some(r_uv) = clip_fn(c as u8) {
+            self.put_rect(r, r_uv, depth, colour, 1);
+        }
+    }
+
+    pub fn put_sprite(&mut self, idx: usize, r: V4, depth: f32, colour: V4) {
+        let r_uv = v4(0.0, 0.5, 40.0/39.75, 0.5).grid_child(idx as usize, 0, 40 as usize, 1);
+        self.put_rect(r, r_uv, depth, colour, 1);
+    }
+
+    pub fn put_sprite_flipx(&mut self, idx: usize, r: V4, depth: f32, colour: V4) {
+        let r_uv = v4(0.0, 0.5, 40.0/39.75, 0.5).grid_child(idx as usize, 0, 40 as usize, 1);
+        self.put_rect_flipx(r, r_uv, depth, colour, 1);
+    }
+
+    pub fn put_sprite_flipy(&mut self, idx: usize, r: V4, depth: f32, colour: V4) {
+        let r_uv = v4(0.0, 0.5, 40.0/39.75, 0.5).grid_child(idx as usize, 0, 40 as usize, 1);
+        self.put_rect_flipy(r, r_uv, depth, colour, 1);
+    }
+
+    pub fn put_sprite_flipxy(&mut self, idx: usize, r: V4, depth: f32, colour: V4) {
+        let r_uv = v4(0.0, 0.5, 40.0/39.75, 0.5).grid_child(idx as usize, 0, 40 as usize, 1);
+        self.put_rect_flipxy(r, r_uv, depth, colour, 1);
+    }
+
+    pub fn put_string_left(&mut self, s: &str, mut x: f32, y: f32, cw: f32, ch: f32, depth: f32, colour: V4) {
+        for c in s.chars() {
+            self.put_glyph(c, v4(x, y, cw, ch), depth, colour);
+            x += cw;
+        }
+    }
+    pub fn put_string_centered(&mut self, s: &str, mut x: f32, mut y: f32, cw: f32, ch: f32, depth: f32, colour: V4) {
+        let w = s.len() as f32 * cw;
+        x -= w/2.0;
+        // y -= ch/2.0;
+        for c in s.chars() {
+            self.put_glyph(c, v4(x, y, cw, ch), depth, colour);
+            x += cw;
+        }
+    }
+}
+
+// ====================
+// Audio stuff
+// ====================
+// 0 : kick drum
+// 1 : sad ding
+
+fn sample_next(o: &mut SampleRequestOptions) -> f32 {
+    let mut acc = 0.0;
+    let mut idx = o.sounds.len();
+    loop {
+        if idx == 0 {
+            break;
+        }
+        idx -= 1;
+
+        if o.sounds[idx].wait > 0.0 {
+            o.sounds[idx].wait -= 1.0/44100.0;
+            continue;
+        }
+
+        o.sounds[idx].elapsed += 1.0/44100.0;
+        o.sounds[idx].remaining -= 1.0/44100.0;
+
+        let t = o.sounds[idx].elapsed;
+
+        if o.sounds[idx].remaining < 0.0 {
+            o.sounds.swap_remove(idx);
+            continue;
+        }
+        if o.sounds[idx].id == 0 {
+            o.sounds[idx].magnitude *= 0.999;
+
+            let f = o.sounds[idx].frequency;
+            let f_trans = f*3.0;
+
+            let t_trans = 1.0/(2.0*PI*f_trans);
+
+            if o.sounds[idx].elapsed < t_trans {
+                o.sounds[idx].phase += f_trans*2.0*PI*1.0/o.sample_rate;
+            } else {
+                o.sounds[idx].phase += f*2.0*PI*1.0/o.sample_rate;
+            }
+            // o.sounds[idx].phase += f*2.0*PI*1.0/o.sample_rate;
+
+            //o.sounds[idx].phase = o.sounds[idx].phase % 2.0*PI; // this sounds really good lol
+
+            acc += (o.sounds[idx].phase).sin() * o.sounds[idx].magnitude
+        } else if o.sounds[idx].id == 1 {
+            o.sounds[idx].magnitude *= o.sounds[idx].mag_exp;
+            o.sounds[idx].frequency *= o.sounds[idx].freq_exp;
+            o.sounds[idx].phase += o.sounds[idx].frequency*2.0*PI*1.0/o.sample_rate;
+            acc += (o.sounds[idx].phase).sin() * o.sounds[idx].magnitude
+        }
+    }
+    acc
+}
+
+#[derive(Debug)]
+pub struct Sound {
+    id: usize,
+    wait: f32,
+    birthtime: f32,
+    elapsed: f32,
+    remaining: f32,
+    magnitude: f32,
+    mag_exp: f32,
+    frequency: f32,
+    freq_exp: f32,
+    phase: f32,
+}
+
+pub struct SampleRequestOptions {
+    pub sample_rate: f32,
+    pub nchannels: usize,
+    pub channel: Consumer<Sound>,
+    pub sounds: Vec<Sound>,
+}
+
+pub fn stream_setup_for<F>(on_sample: F, channel: Consumer<Sound>) -> Result<cpal::Stream, anyhow::Error>
+where
+    F: FnMut(&mut SampleRequestOptions) -> f32 + std::marker::Send + 'static + Copy,
+{
+    let (_host, device, config) = host_device_setup()?;
+
+    match config.sample_format() {
+        cpal::SampleFormat::F32 => stream_make::<f32, _>(&device, &config.into(), on_sample, channel),
+        cpal::SampleFormat::I16 => stream_make::<i16, _>(&device, &config.into(), on_sample, channel),
+        cpal::SampleFormat::U16 => stream_make::<u16, _>(&device, &config.into(), on_sample, channel),
+    }
+}
+
+pub fn host_device_setup(
+) -> Result<(cpal::Host, cpal::Device, cpal::SupportedStreamConfig), anyhow::Error> {
+    let host = cpal::default_host();
+
+    let device = host
+        .default_output_device()
+        .ok_or_else(|| anyhow::Error::msg("Default output device is not available"))?;
+    println!("Output device : {}", device.name()?);
+
+    let config = device.default_output_config()?;
+    println!("Default output config : {:?}", config);
+
+    Ok((host, device, config))
+}
+
+
+pub fn stream_make<T, F>(
+    device: &cpal::Device,
+    config: &cpal::StreamConfig,
+    on_sample: F,
+    channel: Consumer<Sound>,
+) -> Result<cpal::Stream, anyhow::Error>
+where
+    T: cpal::Sample,
+    F: FnMut(&mut SampleRequestOptions) -> f32 + std::marker::Send + 'static + Copy,
+{
+    let sample_rate = config.sample_rate.0 as f32;
+    let nchannels = config.channels as usize;
+    let mut request = SampleRequestOptions {
+        sample_rate,
+        nchannels,
+        sounds: vec![],
+        channel,
+    };
+    let err_fn = |err| eprintln!("Error building output sound stream: {}", err);
+
+    let stream = device.build_output_stream(
+        config,
+        move |output: &mut [T], _: &cpal::OutputCallbackInfo| {
+            on_window(output, &mut request, on_sample)
+        },
+        err_fn,
+    )?;
+
+    Ok(stream)
+}
+
+fn on_window<T, F>(output: &mut [T], request: &mut SampleRequestOptions, mut on_sample: F)
+where
+    T: cpal::Sample,
+    F: FnMut(&mut SampleRequestOptions) -> f32 + std::marker::Send + 'static,
+{
+    if let Some(sc) = request.channel.pop() {
+        request.sounds.push(sc);
+    }
+    for frame in output.chunks_mut(request.nchannels) {
+        let value: T = cpal::Sample::from::<f32>(&on_sample(request));
+        for sample in frame.iter_mut() {
+            *sample = value;
+        }
+    }
+}
+
+// victory screen give some information: time taken, etc. maybe some fireworks. its me reward, undos
 
 // elf can slide through real cool like leaving the title behind him (etched into the ice)
 // lol imagine if i used the sprites for all kind of effects. could use them to make the checkered background
@@ -31,6 +412,16 @@ use core::f32::consts::PI;
 
 // needs a directed graph level
 
+// transitions, probably snow blow would be most thematic, lots of geometry
+// could take a second to show level name
+
+// undo time interpolating back
+
+// cool braid across design for level title
+//  composite a cool pixel buffer for GUI
+
+// dude doing it in C with globals would make it so easy as you could make procs to do everything
+
 pub const TILE_SNOW: usize = 0;
 pub const TILE_WALL: usize = 1;
 pub const TILE_ICE: usize = 2;
@@ -41,7 +432,7 @@ pub const ENT_TARGET: usize = 2;
 pub const ENT_CRATE: usize = 3;
 pub const ENT_NONE: usize = 4;
 
-pub const SLIDE_T: f64 = 0.11;
+pub const SLIDE_T: f64 = 0.07;
 pub const VICTORY_T: f64 = 0.5;
 
 pub struct CurrentLevel {
@@ -87,9 +478,6 @@ impl CurrentLevel {
 
         self.push(ni, nj, dx, dy);
     }
-    // sets move if entity with try_move can move
-    // try move needs to propagate if can move
-    // yea just try move propagation is annoying
 
     fn set_try_move(&mut self, i: usize, j: usize, dx: i32, dy: i32) {
         let idx = j*self.w+i;
@@ -103,7 +491,6 @@ impl CurrentLevel {
     }
 
     fn resolve_movement_attempts(&mut self) {
-        println!("resolve movt attempts");
         for i in 0..self.w {
             for j in 0..self.h {
                 let idx = j*self.w + i;
@@ -119,14 +506,11 @@ impl CurrentLevel {
                 if self.moving_ents[idx] == ENT_NONE { continue; }
                 if self.try_move_x[idx] == 0 && self.try_move_y[idx] == 0 { continue; }
                 if self.can_move(i, j, self.try_move_x[idx], self.try_move_y[idx]) {
-                    println!("setting move {} {}", i, j);
                     self.ent_move_x[idx] = self.try_move_x[idx];
                     if self.moving_ents[idx] == ENT_PLAYER && self.try_move_x[idx] != 0 {
                         self.ent_dir_x[idx] = self.try_move_x[idx];
                     }
                     self.ent_move_y[idx] = self.try_move_y[idx];
-                } else {
-                    println!("canmove false at {} {}", i, j);
                 }
             }
         }
@@ -326,375 +710,6 @@ impl Level {
     }
 }
 
-
-// extreme dopamine mode: scores queue up and get loaded in
-// or if they replenish can you go infinite
-// maybe with time constraint
-
-// make the squares trippy fragment shader programs
-
-// ====================
-// Math
-// ====================
-// might be fucked since it was meant to be 32 bits
-pub fn khash(mut state: usize) -> usize {
-    state = (state ^ 2747636419).wrapping_mul(2654435769);
-    state = (state ^ (state >> 16)).wrapping_mul(2654435769);
-    state = (state ^ (state >> 16)).wrapping_mul(2654435769);
-    state
-}
-pub fn krand(seed: usize) -> f32 {
-    (khash(seed)&0x00000000FFFFFFFF) as f32 / 4294967295.0
-}
-
-fn lerp(a: f32, b: f32, t: f32) -> f32 {
-    a * (1.0 - t) + b * t
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct V2 {
-    x: f32,
-    y: f32,
-}
-fn v2(x: f32, y: f32) -> V2 { V2 { x, y } }
-#[derive(Clone, Copy, Debug)]
-pub struct V3 {
-    x: f32,
-    y: f32,
-    z: f32,
-}
-fn v3(x: f32, y: f32, z: f32) -> V3 { V3 { x, y, z } }
-#[derive(Clone, Copy, Debug)]
-pub struct V4 {
-    x: f32,
-    y: f32,
-    z: f32,
-    w: f32,
-}
-fn v4(x: f32, y: f32, z: f32, w: f32) -> V4 { V4 { x, y, z, w } }
-
-impl V2 {
-    pub fn dot(&self, other: V2) -> f32 {
-        self.x*other.x + self.y * other.y
-    }
-}
-impl V3 {
-    pub fn dot(&self, other: V3) -> f32 {
-        self.x*other.x + self.y * other.y + self.z*other.z
-    }
-}
-impl V4 {
-    pub fn dot(&self, other: V4) -> f32 {
-        self.x*other.x + self.y * other.y + self.z*other.z + self.w*other.w
-    }
-    pub fn tl(&self) -> V2 {v2(self.x, self.y)}
-    pub fn br(&self) -> V2 {v2(self.x + self.z, self.y + self.w)}
-    pub fn tr(&self) -> V2 {v2(self.x + self.z, self.y)}
-    pub fn bl(&self) -> V2 {v2(self.x, self.y + self.w)}
-    pub fn grid_child(&self, i: usize, j: usize, w: usize, h: usize) -> V4 {
-        let cw = self.z / w as f32;
-        let ch = self.w / h as f32;
-        v4(self.x + cw * i as f32, self.y + ch * j as f32, cw, ch)
-    }
-    pub fn hsv_to_rgb(&self) -> V4 {
-        let v = self.z;
-        let hh = (self.x % 360.0) / 60.0;
-        let i = hh.floor() as i32;
-        let ff = hh - i as f32;
-        let p = self.z * (1.0 - self.y);
-        let q = self.z * (1.0 - self.y * ff);
-        let t = self.z * (1.0 - self.y * (1.0 - ff));
-        match i {
-            0 => v4(v, t, p, self.w),
-            1 => v4(q, v, p, self.w),
-            2 => v4(p, v, t, self.w),
-            3 => v4(p, q, v, self.w),
-            4 => v4(t, p, v, self.w),
-            5 => v4(v, p, q, self.w),
-            _ => panic!("unreachable"),
-        }
-    }
-    fn contains(&self, p: V2) -> bool {
-        !(p.x < self.x || p.x > self.x + self.z || p.y < self.y || p.y > self.y + self.w)
-    }
-    fn point_within(&self, p: V2) -> V2 {
-        v2(p.x*self.z+self.x, p.y*self.w+self.y)
-    }
-    fn point_without(&self, p: V2) -> V2 {
-        v2((p.x - self.x) / self.z, (p.y - self.y) / self.w)
-    }
-    fn fit_aspect(&self, a: f32) -> V4 {
-        let a_self = self.z/self.w;
-
-        if a_self > a {
-            // parent wider
-            v4((self.z - self.z*(1.0/a))/2.0, 0.0, self.z*1.0/a, self.w)
-        } else {
-            // child wider
-            v4(0.0, (self.w - self.w*(1.0/a))/2.0, self.z, self.w*a)
-        }
-    }
-}
-
-
-// ====================
-// Canvas
-// ====================
-pub struct CTCanvas {
-    buf: Vec<u8>,
-}
-
-impl CTCanvas {
-    pub fn new() -> CTCanvas {
-        CTCanvas {
-            buf: Vec::new(),
-        }
-    }
-
-    fn put_u32(&mut self, x: u32) {
-        for b in x.to_le_bytes() {
-            self.buf.push(b);
-        }
-    }
-
-    fn put_float(&mut self, x: f32) {
-        for b in x.to_le_bytes() {
-            self.buf.push(b);
-        }
-    }
-
-    pub fn put_vertex(&mut self, p: V3, uv: V2, col: V4, mode: u32) {
-        self.put_float(p.x);
-        self.put_float(p.y);
-        self.put_float(p.z);
-        self.put_float(col.x);
-        self.put_float(col.y);
-        self.put_float(col.z);
-        self.put_float(col.w);
-        self.put_float(uv.x);
-        self.put_float(uv.y);
-        self.put_u32(mode);
-    }
-    pub fn put_triangle(&mut self, p1: V2, uv1: V2, p2: V2, uv2: V2, p3: V2, uv3: V2, depth: f32, colour: V4, mode: u32) {
-        self.put_vertex(v3(p1.x, p1.y, depth), uv1, colour, mode);
-        self.put_vertex(v3(p2.x, p2.y, depth), uv2, colour, mode);
-        self.put_vertex(v3(p3.x, p3.y, depth), uv3, colour, mode);
-    }
-    pub fn put_quad(&mut self, p1: V2, uv1: V2, p2: V2, uv2: V2, p3: V2, uv3: V2, p4: V2, uv4: V2, depth: f32, colour: V4, mode: u32) {
-        self.put_triangle(p1, uv1, p2, uv2, p3, uv3, depth, colour, mode);
-        self.put_triangle(p4, uv4, p2, uv2, p3, uv3, depth, colour, mode);
-    }
-
-    pub fn put_rect(&mut self, r: V4, r_uv: V4, depth: f32, colour: V4, mode: u32) {
-        self.put_triangle(r.tl(), r_uv.tl(), r.tr(), r_uv.tr(), r.bl(), r_uv.bl(), depth, colour, mode);
-        self.put_triangle(r.bl(), r_uv.bl(), r.tr(), r_uv.tr(), r.br(), r_uv.br(), depth, colour, mode);
-    }
-
-    pub fn put_rect_flipx(&mut self, r: V4, r_uv: V4, depth: f32, colour: V4, mode: u32) {
-        self.put_triangle(r.tl(), r_uv.tr(), r.tr(), r_uv.tl(), r.bl(), r_uv.br(), depth, colour, mode);
-        self.put_triangle(r.bl(), r_uv.br(), r.tr(), r_uv.tl(), r.br(), r_uv.bl(), depth, colour, mode);
-    }
-
-    pub fn put_glyph(&mut self, c: char, r: V4, depth: f32, colour: V4) {
-        let clip_fn = |mut c: u8| {
-            if c >= 'a' as u8 && c <= 'z' as u8 {
-                c -= 'a' as u8 - 'A' as u8;
-            }
-            if c >= '+' as u8 && c <= '_' as u8 {
-                let x = c - '+' as u8;
-                let w = '_' as u8 - '+' as u8 + 1; // maybe +1
-                Some(v4(0.0, 0.0, 1.0, 0.5).grid_child(x as usize, 0, w as usize, 1))
-            } else {
-                None
-            }
-        };
-        if let Some(r_uv) = clip_fn(c as u8) {
-            self.put_rect(r, r_uv, depth, colour, 1);
-        }
-    }
-
-    pub fn put_sprite(&mut self, idx: usize, r: V4, depth: f32, colour: V4) {
-        let r_uv = v4(0.0, 0.5, 40.0/39.75, 0.5).grid_child(idx as usize, 0, 40 as usize, 1);
-        self.put_rect(r, r_uv, depth, colour, 1);
-    }
-
-    pub fn put_sprite_flipx(&mut self, idx: usize, r: V4, depth: f32, colour: V4) {
-        let r_uv = v4(0.0, 0.5, 40.0/39.75, 0.5).grid_child(idx as usize, 0, 40 as usize, 1);
-        self.put_rect_flipx(r, r_uv, depth, colour, 1);
-    }
-
-    pub fn put_string_left(&mut self, s: &str, mut x: f32, y: f32, cw: f32, ch: f32, depth: f32, colour: V4) {
-        for c in s.chars() {
-            self.put_glyph(c, v4(x, y, cw, ch), depth, colour);
-            x += cw;
-        }
-    }
-    pub fn put_string_centered(&mut self, s: &str, mut x: f32, mut y: f32, cw: f32, ch: f32, depth: f32, colour: V4) {
-        let w = s.len() as f32 * cw;
-        x -= w/2.0;
-        // y -= ch/2.0;
-        for c in s.chars() {
-            self.put_glyph(c, v4(x, y, cw, ch), depth, colour);
-            x += cw;
-        }
-    }
-}
-
-// ====================
-// Audio stuff
-// ====================
-// 0 : kick drum
-// 1 : sad ding
-
-fn sample_next(o: &mut SampleRequestOptions) -> f32 {
-    let mut acc = 0.0;
-    let mut idx = o.sounds.len();
-    loop {
-        if idx == 0 {
-            break;
-        }
-        idx -= 1;
-
-        if o.sounds[idx].wait > 0.0 {
-            o.sounds[idx].wait -= 1.0/44100.0;
-            continue;
-        }
-
-        o.sounds[idx].elapsed += 1.0/44100.0;
-        o.sounds[idx].remaining -= 1.0/44100.0;
-
-        let t = o.sounds[idx].elapsed;
-
-        if o.sounds[idx].remaining < 0.0 {
-            o.sounds.swap_remove(idx);
-            continue;
-        }
-        if o.sounds[idx].id == 0 {
-            o.sounds[idx].magnitude *= 0.999;
-
-            let f = o.sounds[idx].frequency;
-            let f_trans = f*3.0;
-
-            let t_trans = 1.0/(2.0*PI*f_trans);
-
-            if o.sounds[idx].elapsed < t_trans {
-                o.sounds[idx].phase += f_trans*2.0*PI*1.0/o.sample_rate;
-            } else {
-                o.sounds[idx].phase += f*2.0*PI*1.0/o.sample_rate;
-            }
-            // o.sounds[idx].phase += f*2.0*PI*1.0/o.sample_rate;
-
-            //o.sounds[idx].phase = o.sounds[idx].phase % 2.0*PI; // this sounds really good lol
-
-            acc += (o.sounds[idx].phase).sin() * o.sounds[idx].magnitude
-        } else if o.sounds[idx].id == 1 {
-            o.sounds[idx].magnitude *= o.sounds[idx].mag_exp;
-            o.sounds[idx].frequency *= o.sounds[idx].freq_exp;
-            o.sounds[idx].phase += o.sounds[idx].frequency*2.0*PI*1.0/o.sample_rate;
-            acc += (o.sounds[idx].phase).sin() * o.sounds[idx].magnitude
-        }
-    }
-    acc
-}
-
-#[derive(Debug)]
-pub struct Sound {
-    id: usize,
-    wait: f32,
-    birthtime: f32,
-    elapsed: f32,
-    remaining: f32,
-    magnitude: f32,
-    mag_exp: f32,
-    frequency: f32,
-    freq_exp: f32,
-    phase: f32,
-}
-
-pub struct SampleRequestOptions {
-    pub sample_rate: f32,
-    pub nchannels: usize,
-    pub channel: Consumer<Sound>,
-    pub sounds: Vec<Sound>,
-}
-
-pub fn stream_setup_for<F>(on_sample: F, channel: Consumer<Sound>) -> Result<cpal::Stream, anyhow::Error>
-where
-    F: FnMut(&mut SampleRequestOptions) -> f32 + std::marker::Send + 'static + Copy,
-{
-    let (_host, device, config) = host_device_setup()?;
-
-    match config.sample_format() {
-        cpal::SampleFormat::F32 => stream_make::<f32, _>(&device, &config.into(), on_sample, channel),
-        cpal::SampleFormat::I16 => stream_make::<i16, _>(&device, &config.into(), on_sample, channel),
-        cpal::SampleFormat::U16 => stream_make::<u16, _>(&device, &config.into(), on_sample, channel),
-    }
-}
-
-pub fn host_device_setup(
-) -> Result<(cpal::Host, cpal::Device, cpal::SupportedStreamConfig), anyhow::Error> {
-    let host = cpal::default_host();
-
-    let device = host
-        .default_output_device()
-        .ok_or_else(|| anyhow::Error::msg("Default output device is not available"))?;
-    println!("Output device : {}", device.name()?);
-
-    let config = device.default_output_config()?;
-    println!("Default output config : {:?}", config);
-
-    Ok((host, device, config))
-}
-
-
-pub fn stream_make<T, F>(
-    device: &cpal::Device,
-    config: &cpal::StreamConfig,
-    on_sample: F,
-    channel: Consumer<Sound>,
-) -> Result<cpal::Stream, anyhow::Error>
-where
-    T: cpal::Sample,
-    F: FnMut(&mut SampleRequestOptions) -> f32 + std::marker::Send + 'static + Copy,
-{
-    let sample_rate = config.sample_rate.0 as f32;
-    let nchannels = config.channels as usize;
-    let mut request = SampleRequestOptions {
-        sample_rate,
-        nchannels,
-        sounds: vec![],
-        channel,
-    };
-    let err_fn = |err| eprintln!("Error building output sound stream: {}", err);
-
-    let stream = device.build_output_stream(
-        config,
-        move |output: &mut [T], _: &cpal::OutputCallbackInfo| {
-            on_window(output, &mut request, on_sample)
-        },
-        err_fn,
-    )?;
-
-    Ok(stream)
-}
-
-fn on_window<T, F>(output: &mut [T], request: &mut SampleRequestOptions, mut on_sample: F)
-where
-    T: cpal::Sample,
-    F: FnMut(&mut SampleRequestOptions) -> f32 + std::marker::Send + 'static,
-{
-    if let Some(sc) = request.channel.pop() {
-        request.sounds.push(sc);
-    }
-    for frame in output.chunks_mut(request.nchannels) {
-        let value: T = cpal::Sample::from::<f32>(&on_sample(request));
-        for sample in frame.iter_mut() {
-            *sample = value;
-        }
-    }
-}
-
-
 fn main() {
     unsafe {
         let mut xres = 1600i32;
@@ -810,18 +825,30 @@ fn main() {
         // Simulation
         // ====================
         let worlds: Vec<(&str, Vec<Level>)> = vec![
-            ("world1",vec![
-                Level::from("ice to meet you", include_str!("levels/world2/1.lvl")),
+            ("introduction",vec![
                 Level::from("wasd to move", include_str!("levels/world1/0.lvl")),
                 Level::from("z to undo", include_str!("levels/world1/1.lvl")),
                 Level::from("failure is the key to success", include_str!("levels/world1/2.lvl")),
                 Level::from("greed test", include_str!("levels/world1/4.lvl")),
                 Level::from("get around it", include_str!("levels/world1/3.lvl")),
             ]),
-            ("world2",vec![
+            ("world of ice",vec![
                 Level::from("ice to meet you", include_str!("levels/world2/1.lvl")),
                 Level::from("blocking", include_str!("levels/world2/2.lvl")),
                 Level::from("dont get stuck on this one", include_str!("levels/world2/3.lvl")),
+                Level::from("promotion", include_str!("levels/world2/4.lvl")),
+                Level::from("ring ding", include_str!("levels/world2/5.lvl")),
+                Level::from("ring ding 2", include_str!("levels/world2/6.lvl")),
+                Level::from("L", include_str!("levels/world2/7.lvl")),
+            ]),
+            ("crate land",vec![
+                Level::from("youre doing crate", include_str!("levels/world3/1.lvl")),
+                Level::from("crate assistance", include_str!("levels/world3/2.lvl")),
+                Level::from("overshoot", include_str!("levels/world3/3.lvl")),
+                Level::from("crate repository", include_str!("levels/world3/4.lvl")),
+                Level::from("pokey pokey", include_str!("levels/world3/5.lvl")),
+                Level::from("icey nicey", include_str!("levels/world3/6.lvl")),
+                Level::from("lalalala", include_str!("levels/world3/7.lvl")),
             ]),
         ];
 
@@ -832,10 +859,14 @@ fn main() {
         let mut snow_t = 0.0;
         let mut t_move = 0.0;
         let mut t_last = Instant::now();
+        let mut t_level = 0.0;
         let mut mouse_pos = v2(0., 0.);
+
+        let mut level_undos = 0;
 
         let mut animating = false;
         let mut victory = false;
+        let mut victory_panel_y = 1.0;
         let mut buffered_dx = 0;
         let mut buffered_dy = 0;
 
@@ -844,6 +875,7 @@ fn main() {
         let mut history: Vec<HistoryEntry> = Vec::new();
 
         let mut menu = false;
+
 
         event_loop.run(move |event, _, _| {
 
@@ -884,6 +916,9 @@ fn main() {
                                         buffered_dx = 0;
                                         buffered_dy = 0;
                                         animating = false;
+                                        t_level = 0.0;
+                                        level_undos = 0;
+                                        victory_panel_y = 1.0;
                                         history = vec![];
                                         return;
                                     }
@@ -932,6 +967,7 @@ fn main() {
                                                     curr_level.ent_dir_x = he.ent_dir_x;
                                                     snow_t = he.snow_t;
                                                     prod.push(Sound { id: 1, birthtime: t as f32, elapsed: 0.0, remaining: 0.2, magnitude: 0.1, mag_exp: 0.9999, frequency: 100.0, freq_exp: 1.0002, wait: 0.0, phase: 0.0 }).unwrap();
+                                                    level_undos = 0;
                                                 }
                                             }
                                         },
@@ -951,6 +987,9 @@ fn main() {
                     t += dt;
                     snow_t += dt as f32;
                     t_last = t_now;
+                    if !victory {
+                        t_level += dt as f32;
+                    }
 
                     let mut canvas = CTCanvas::new();
 
@@ -984,7 +1023,6 @@ fn main() {
                             prod.push(Sound { id: 1, birthtime: t as f32, elapsed: 0.0, remaining: 0.1, magnitude: 0.1, mag_exp: 0.999, frequency: 440.0 / (3./2.), freq_exp: 1.0, wait: 0.0, phase: 0.0 }).unwrap();
                         }
                         if curr_level.any_try_move() {
-                            dbg!("any try move true");
                             t_move = t;
                             curr_level.resolve_movement_attempts();
                         } else {
@@ -1011,18 +1049,11 @@ fn main() {
                         }
                     }
 
-
-
-                    // sliding: for undos whole slides need to be accounted for
-                    // but whether something loses its aspiration to move
-
                     if curr_level.remaining_presents() == 0 &&!victory {
                         victory = true;
                         animating = true;
                     }
 
-
-                    // canvas.put_rect(screen_rect, v4(0., 0., 1., 1.), 0.9, v4(0.2, 0.2, 0.2, 1.0), 0);
                     canvas.put_rect(screen_rect, v4(0., 0., 1., 1.), 0.9, v4(0.2, 0.2, 0.2, 1.0), 0);
                     canvas.put_rect(level_rect, v4(0., 0., 1., 1.), 0.0, v4(0.7, 0.2, 0.6, 1.0), 0);
 
@@ -1053,10 +1084,14 @@ fn main() {
                                 TILE_ICE => 2,
                                 _ => continue,
                             };
+                            let depth = match curr_level.tiles[j*w + i] {
+                                TILE_ICE => -0.05,
+                                _ => -0.1,
+                            };
 
                             let r = level_rect.grid_child(i, j, w, h);
 
-                            canvas.put_sprite(sprite, r, -0.1, v4(1., 1., 1., 1.));
+                            canvas.put_sprite(sprite, r, depth, v4(1., 1., 1., 1.));
                         }
                     }
 
@@ -1066,6 +1101,56 @@ fn main() {
                             if curr_level.static_ents[j*curr_level.w+i] != ENT_TARGET { continue; }
                             let r = level_rect.grid_child(i, j, w, h);
                             canvas.put_sprite(6, r, -0.19, v4(1., 1., 1., 1.));
+                        }
+                    }
+
+                    // entity reflections
+                    for i in 0..curr_level.w {
+                        for j in 1..curr_level.h {
+                            let idx = (j-1)*curr_level.w + i;
+                            let e_above = curr_level.moving_ents[(j-1)*curr_level.w + i];
+                            if e_above != ENT_NONE {
+                                let mut r = level_rect.grid_child(i, j, w, h);
+                                let mut x_shift = (curr_level.ent_move_x[idx] as f32 * r.w * ((t - t_move)/SLIDE_T) as f32) / aspect;
+                                let mut y_shift = curr_level.ent_move_y[idx] as f32 * r.z * ((t - t_move)/SLIDE_T) as f32;
+                                if x_shift == 0.0 && y_shift == 0.0 {
+                                    let tt = ((t - t_move)/SLIDE_T) as f32;
+                                    let ss = 1./16. * 2.0 * (0.5 - (tt - 0.5).abs());
+                                    x_shift = curr_level.try_move_x[idx] as f32 * r.w * ss / aspect;
+                                    y_shift = curr_level.try_move_y[idx] as f32 * r.z * ss;
+                                }
+                                r.x += x_shift;
+                                r.y += y_shift;
+                                let sprite = match e_above {
+                                    ENT_PLAYER => if t % 1.0 > 0.5 {
+                                        4 
+                                    } else {
+                                        5
+                                    },
+                                    ENT_CRATE => 7,
+                                    ENT_PRESENT => 9,
+                                    _ => continue,
+                                };
+                                if e_above != ENT_PLAYER || curr_level.ent_dir_x[idx] < 0 {
+                                    canvas.put_sprite_flipy(sprite, r, -0.07, v4(1., 1., 1., 1.));
+                                } else {
+                                    canvas.put_sprite_flipxy(sprite, r, -0.07, v4(1., 1., 1., 1.));
+                                }
+                            }
+                        }
+                    }
+
+                    // translucent ice layer
+                    for i in 0..w {
+                        for j in 0..h {
+                            let sprite = match curr_level.tiles[j*w + i] {
+                                TILE_ICE => 3,
+                                _ => continue,
+                            };
+
+                            let r = level_rect.grid_child(i, j, w, h);
+
+                            canvas.put_sprite(sprite, r, -0.185, v4(1., 1., 1., 1.));
                         }
                     }
 
@@ -1083,12 +1168,12 @@ fn main() {
                                 _ => continue,
                             };
                             let mut r = level_rect.grid_child(i, j, w, h);
-                            let mut x_shift = curr_level.ent_move_x[idx] as f32 * r.w * ((t - t_move)/SLIDE_T) as f32;
+                            let mut x_shift = (curr_level.ent_move_x[idx] as f32 * r.w * ((t - t_move)/SLIDE_T) as f32) / aspect;
                             let mut y_shift = curr_level.ent_move_y[idx] as f32 * r.z * ((t - t_move)/SLIDE_T) as f32;
                             if x_shift == 0.0 && y_shift == 0.0 {
                                 let tt = ((t - t_move)/SLIDE_T) as f32;
                                 let ss = 1./16. * 2.0 * (0.5 - (tt - 0.5).abs());
-                                x_shift = curr_level.try_move_x[idx] as f32 * r.w * ss;
+                                x_shift = curr_level.try_move_x[idx] as f32 * r.w * ss / aspect;
                                 y_shift = curr_level.try_move_y[idx] as f32 * r.z * ss;
                             }
                             r.x += x_shift;
@@ -1110,15 +1195,13 @@ fn main() {
                         }
                     }
 
-                    // ok how we drawin that snow
-                    // gotta transform it to be not stretched also
-                    let num_cols = 60.0 * aspect;
+                    let num_cols = 100.0 * aspect;
                     for i in 0..num_cols.floor() as usize + 10 {
                         let col_x = 2.0 * i as f32 / num_cols as f32;
                         let col_seed = khash(i + 12312947);
-                        let phase = (krand(col_seed) + 0.05*snow_t as f32) % 1.0;
+                        let phase = (krand(col_seed) + 0.03*snow_t as f32) % 1.0;
                         let y = phase * 2.5 - 1.5;
-                        let x = (col_x + phase * 0.05 + 0.07*(10.0 * phase + 2.0*PI*krand(col_seed+1238124517)).sin()) * 2.0 - 1.5;
+                        let x = (col_x + phase * 0.05 + 0.09*(10.0 * phase + 2.0*PI*krand(col_seed+1238124517)).sin()) * 2.0 - 1.5;
                         let r = v4(x, y, 0.03/aspect, 0.03);
                         canvas.put_rect(r.grid_child(1, 0, 3, 3), v4(0., 0., 1., 1.), -0.3, v4(1., 1., 1., 1.), 0);
                         canvas.put_rect(r.grid_child(1, 2, 3, 3), v4(0., 0., 1., 1.), -0.3, v4(1., 1., 1., 1.), 0);
@@ -1126,14 +1209,43 @@ fn main() {
                         canvas.put_rect(r.grid_child(2, 1, 3, 3), v4(0., 0., 1., 1.), -0.3, v4(1., 1., 1., 1.), 0);
                     }
 
+                    
+                    // we should do a pixelated braid pattern
+                    let buffer_w = (aspect * 100.0).floor() as usize;
+                    let buffer_h = 100.0 as usize;
+                    let pattern_w =  buffer_w;
+                    let pattern_h = 10.0 as usize;
+                    let mut buf = vec![v4(0., 0., 0., 1.); pattern_w * pattern_h];
+
+                    let c1 = v4(0.7, 0.0, 0.0, 1.0);
+                    let c2 = v4(0.0, 0.7, 0.0, 1.0);
+
+                    for i in 0..pattern_w {
+                        for j in 0..pattern_h {
+                            if i < pattern_h || i > pattern_w - pattern_h {
+                                if (i % 2 == 0) ^ (j % 2 == 0) {
+                                    buf[j*buffer_w + i] = c1;
+                                } else {
+                                    buf[j*buffer_w + i] = c2;
+                                }
+                            }
+                        }
+                    }
+
+                    // yea transitions im thinking snow blows in, plus fade white: level number and name fades in, then fades out, then white fades and becomes level
+                    // simulated snowflakes as well as closed form snowflakes
+                    // or just with a separate closed form actually
+                    // or wind picks up
+                    // fuck i could do this concisely in C with globals and procedures
+
                     // print level name
                     canvas.put_string_left(&worlds[curr_world_num].1[curr_level_num].title, -1., 1. - 0.06, 0.06*14./16.*yres as f32/xres as f32, 0.06, -0.4, v4(1., 1., 1., 1.));
 
-                    // string may need to be * aspect
-
-                    // demonstrate victory
-                    // unfurling banner where victory fades in
                     if victory {
+                        // blah blah victory panel Y
+                        // in saying that maybe better to record t_victory and have a closed form solution that way can overshoot
+                        // put time, undos used, 
+
                         canvas.put_string_centered("victory", 0.0, 0.0, 0.1*14./16.*yres as f32/xres as f32, 0.1, -0.4, v4(1., 1., 1., 1.,));
                     }
 

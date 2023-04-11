@@ -21,3 +21,6 @@ undos etc
 
 
 rectangles top left bottom right etc, maybe it would work
+
+
+i could refactor it into a god object and split it into many pieces with methods basically
